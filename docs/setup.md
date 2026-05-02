@@ -28,6 +28,12 @@ Create the Google-backed kit:
 ./bin/skirk setup init --out skirk-kit
 ```
 
+You can also run the interactive operator menu:
+
+```bash
+./bin/skirk
+```
+
 If Application Default Credentials are missing, setup runs:
 
 ```bash
@@ -65,6 +71,8 @@ On the client:
 ./bin/skirk serve-client --config client.json --listen 127.0.0.1:18080
 ```
 
+This is the default Linux path. No GUI is required.
+
 Point apps at SOCKS5:
 
 ```bash
@@ -89,6 +97,18 @@ To clean up the workspace:
 
 ```bash
 ./bin/skirk workspace delete --config skirk-kit/exit.json --delete-drive-folder
+```
+
+Or use the higher-level revoke command:
+
+```bash
+./bin/skirk revoke --config skirk-kit/exit.json
+```
+
+To also revoke the Google OAuth refresh token in that config:
+
+```bash
+./bin/skirk revoke --config skirk-kit/exit.json --revoke-oauth
 ```
 
 To revoke every config generated from the same OAuth login, remove the app access from Google Account security settings. Workspace deletion removes Skirk's current mailbox; OAuth revocation prevents old configs from creating or using another mailbox.

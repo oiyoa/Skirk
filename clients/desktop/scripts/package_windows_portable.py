@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+
+def main() -> int:
+    repo = Path(__file__).resolve().parents[3]
+    desktop = repo / "clients" / "desktop"
+    exe_candidates = [
+        desktop / "src-tauri" / "target" / "release" / "skirk-desktop.exe",
+        desktop / "src-tauri" / "target" / "release" / "bundle" / "nsis" / "Skirk.exe",
+    ]
+    app_exe = next((path for path in exe_candidates if path.exists()), None)
+    if app_exe is None:
+        print("Windows Tauri executable not found. Run `npm run tauri build` on Windows first.", file=sys.stderr)
+        return 1
+
+    out_dir = repo / "dist" / "windows-portable" / "Skirk"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    (out_dir / "sidecars" / "windows").mkdir(parents=True)
+    (out_dir / "portable-data").mkdir()
+
+    shutil.copy2(app_exe, out_dir / "Skirk.exe")
+    sidecar = desktop / "src-tauri" / "resources" / "sidecars" / "windows" / "skirk.exe"
+    if not sidecar.exists():
+        sidecar = repo / "bin" / "skirk-windows-amd64.exe"
+    if not sidecar.exists():
+        print("skirk.exe sidecar not found. Run `make build-windows` first.", file=sys.stderr)
+        return 1
+    shutil.copy2(sidecar, out_dir / "sidecars" / "windows" / "skirk.exe")
+    (out_dir / "skirk-portable").write_text("portable mode marker\n", encoding="utf-8")
+    (out_dir / "portable-data" / "README.txt").write_text(
+        "Skirk portable data lives here. Imported profiles, configs, and logs stay beside Skirk.exe.\n",
+        encoding="utf-8",
+    )
+
+    zip_path = repo / "dist" / "windows-portable" / "Skirk_windows_x64_portable.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in out_dir.rglob("*"):
+            archive.write(path, path.relative_to(out_dir.parent))
+    print(zip_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

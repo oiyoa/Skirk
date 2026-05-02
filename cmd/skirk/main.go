@@ -27,12 +27,11 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) < 2 {
-		usage()
-		return nil
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	if len(args) < 2 {
+		return menu(ctx)
+	}
 	switch args[1] {
 	case "keygen":
 		secret, err := skirk.RandomSecret()
@@ -45,6 +44,8 @@ func run(args []string) error {
 		return workspace(ctx, args[2:])
 	case "setup":
 		return setup(ctx, args[2:])
+	case "revoke":
+		return revoke(ctx, args[2:])
 	case "hybrid-send":
 		return hybridSend(ctx, args[2:])
 	case "hybrid-recv":
@@ -55,7 +56,13 @@ func run(args []string) error {
 		return bench(ctx, args[2:])
 	case "serve-client":
 		return serveClient(ctx, args[2:])
+	case "client":
+		return serveClient(ctx, args[2:])
+	case "client-ui":
+		return clientUI(ctx, args[2:])
 	case "serve-exit":
+		return serveExit(ctx, args[2:])
+	case "exit":
 		return serveExit(ctx, args[2:])
 	case "sample-config":
 		return sampleConfig(args[2:])
@@ -70,6 +77,7 @@ func usage() {
   keygen
   sample-config --out skirk.json --spreadsheet-id SHEET_ID --secret SECRET
   setup init --out skirk-kit
+  revoke --config skirk-kit/exit.json [--revoke-oauth]
   workspace create --config skirk.json --title TITLE --sheet skirk
   workspace delete --config skirk.json --spreadsheet-id SHEET_ID [--delete-drive-folder]
   hybrid-send --config skirk.json --input file.bin [--session SESSION]
@@ -77,7 +85,8 @@ func usage() {
   e2e --config skirk.json [--bytes 2048] [--delete-after]
   bench --config skirk.json --sizes 8192,65536 --chunk-sizes 8192,65536 [--temp-workspace]
   serve-exit --config skirk.json
-  serve-client --config skirk.json [--listen 127.0.0.1:18080]`)
+  serve-client --config skirk.json [--listen 127.0.0.1:18080]
+  client-ui --config skirk.json [--socks 127.0.0.1:18080] [--ui 127.0.0.1:18280]`)
 }
 
 func load(path string) (*skirk.Config, *skirk.DriveStore, *skirk.SheetsLog, *skirk.Workspace, error) {
@@ -143,6 +152,46 @@ func workspace(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown workspace command %q", args[0])
 	}
+}
+
+func revoke(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("revoke", flag.ExitOnError)
+	configPath := fs.String("config", "skirk-kit/exit.json", "config path")
+	revokeOAuth := fs.Bool("revoke-oauth", false, "also revoke the Google OAuth refresh/access token in this config")
+	keepWorkspace := fs.Bool("keep-workspace", false, "do not delete the Sheet and Drive folder")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := skirk.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	_, _, workspace, err := skirk.StoresFromConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	result := map[string]any{"config": *configPath}
+	if !*keepWorkspace {
+		if cfg.Sheets.SpreadsheetID != "" {
+			if err := workspace.DeleteSpreadsheet(ctx, cfg.Sheets.SpreadsheetID); err != nil {
+				return err
+			}
+			result["deleted_spreadsheet_id"] = cfg.Sheets.SpreadsheetID
+		}
+		if cfg.Drive.FolderID != "" {
+			if err := workspace.DeleteDriveFile(ctx, cfg.Drive.FolderID); err != nil {
+				return err
+			}
+			result["deleted_drive_folder_id"] = cfg.Drive.FolderID
+		}
+	}
+	if *revokeOAuth {
+		if err := cfg.Auth.Revoke(ctx, cfg.Route); err != nil {
+			return err
+		}
+		result["oauth_revoked"] = true
+	}
+	return printJSON(result)
 }
 
 func hybridSend(ctx context.Context, args []string) error {

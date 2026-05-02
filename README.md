@@ -20,6 +20,12 @@ Build:
 make build
 ```
 
+Open the operator menu:
+
+```bash
+./bin/skirk
+```
+
 Create a Google-backed kit:
 
 ```bash
@@ -41,6 +47,20 @@ Run the client SOCKS5 proxy:
 curl --socks5-hostname 127.0.0.1:18080 http://example.com/
 ```
 
+Optional: run the desktop dashboard on Windows or a desktop Linux machine with a browser:
+
+```bash
+./bin/skirk client-ui --config skirk-kit/client.json --socks 127.0.0.1:18080 --ui 127.0.0.1:18280
+```
+
+Preferred Windows app:
+
+```bash
+cd clients/desktop
+npm install
+npm run tauri dev
+```
+
 ## Cleanup
 
 Delete the Google Sheet and Drive folder created by setup:
@@ -60,6 +80,7 @@ Generated configs contain a Google refresh token and the Skirk tunnel secret. Tr
 ## Documentation
 
 - [Setup Guide](docs/setup.md)
+- [Client Guide](docs/clients.md)
 - [Go CLI Notes](docs/go_skirk.md)
 - [Drive + Sheets Architecture](docs/skirk_drive_sheets_architecture.md)
 - [Modes](docs/skirk_modes.md)

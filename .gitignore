@@ -23,4 +23,12 @@ skirk_research_bundle.zip
 
 # Go build outputs
 /bin/
+/dist/
+clients/desktop/node_modules/
+clients/desktop/dist/
+clients/desktop/src-tauri/target/
+clients/desktop/src-tauri/resources/sidecars/
+clients/desktop/src-tauri/gen/
+clients/android/.gradle/
+clients/android/app/build/
 coverage.out

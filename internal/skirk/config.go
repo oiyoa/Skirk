@@ -120,6 +120,27 @@ func (a AuthConfig) Token(ctx context.Context) (string, error) {
 	return a.TokenForRoute(ctx, RouteConfig{Mode: "direct"})
 }
 
+func (a AuthConfig) Revoke(ctx context.Context, route RouteConfig) error {
+	token := strings.TrimSpace(a.RefreshToken)
+	if token == "" {
+		token = strings.TrimSpace(a.AccessToken)
+	}
+	if token == "" {
+		return errors.New("auth.refresh_token or auth.access_token is required for OAuth revocation")
+	}
+	values := url.Values{}
+	values.Set("token", token)
+	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	result, err := NewGoogleHTTPClient(route).Request(ctx, http.MethodPost, "oauth2.googleapis.com", "/revoke", headers, []byte(values.Encode()))
+	if err != nil {
+		return err
+	}
+	if result.Status == http.StatusOK {
+		return nil
+	}
+	return require2xx(result, "oauth revoke")
+}
+
 func (a AuthConfig) TokenForRoute(ctx context.Context, route RouteConfig) (string, error) {
 	if token := strings.TrimSpace(os.Getenv("SKIRK_ACCESS_TOKEN")); token != "" {
 		return token, nil

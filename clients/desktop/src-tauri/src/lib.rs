@@ -1,0 +1,551 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    fs::{self, OpenOptions},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::Mutex,
+};
+use tauri::{Manager, State};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientProfile {
+    id: String,
+    name: String,
+    config_path: String,
+    socks_host: String,
+    socks_port: u16,
+    route_mode: String,
+    spreadsheet_id: String,
+    drive_folder_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ConnectionPhase {
+    Disconnected,
+    Connecting,
+    Connected,
+    Disconnecting,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionStatus {
+    phase: ConnectionPhase,
+    active_profile_id: Option<String>,
+    pid: Option<u32>,
+    socks_address: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSnapshot {
+    profiles: Vec<ClientProfile>,
+    selected_profile_id: Option<String>,
+    connection: ConnectionStatus,
+    logs_dir: String,
+    config_dir: String,
+    log_tail: String,
+    platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    selected_profile_id: Option<String>,
+}
+
+struct ManagedClient {
+    child: Child,
+    profile_id: String,
+    socks_address: String,
+}
+
+#[derive(Default)]
+struct RuntimeState {
+    client: Option<ManagedClient>,
+    phase: ConnectionPhase,
+    message: String,
+}
+
+impl Default for ConnectionPhase {
+    fn default() -> Self {
+        Self::Disconnected
+    }
+}
+
+struct DesktopRuntime {
+    paths: AppPaths,
+    resource_dir: Option<PathBuf>,
+    inner: Mutex<RuntimeState>,
+}
+
+#[derive(Clone)]
+struct AppPaths {
+    config_dir: PathBuf,
+    logs_dir: PathBuf,
+    profiles_file: PathBuf,
+    settings_file: PathBuf,
+}
+
+impl DesktopRuntime {
+    fn new(paths: AppPaths, resource_dir: Option<PathBuf>) -> Self {
+        Self {
+            paths,
+            resource_dir,
+            inner: Mutex::new(RuntimeState::default()),
+        }
+    }
+
+    fn snapshot(&self) -> Result<DesktopSnapshot, String> {
+        let profiles = load_profiles(&self.paths)?;
+        let mut settings = load_settings(&self.paths)?;
+        if settings
+            .selected_profile_id
+            .as_ref()
+            .map(|id| profiles.iter().any(|profile| &profile.id == id))
+            .unwrap_or(false)
+            == false
+        {
+            settings.selected_profile_id = profiles.first().map(|profile| profile.id.clone());
+            save_settings(&self.paths, &settings)?;
+        }
+
+        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned")?;
+        refresh_state(&mut state);
+        let connection = if let Some(client) = state.client.as_ref() {
+            ConnectionStatus {
+                phase: state.phase.clone(),
+                active_profile_id: Some(client.profile_id.clone()),
+                pid: Some(client.child.id()),
+                socks_address: Some(client.socks_address.clone()),
+                message: state.message.clone(),
+            }
+        } else {
+            ConnectionStatus {
+                phase: state.phase.clone(),
+                active_profile_id: None,
+                pid: None,
+                socks_address: None,
+                message: state.message.clone(),
+            }
+        };
+
+        Ok(DesktopSnapshot {
+            profiles,
+            selected_profile_id: settings.selected_profile_id,
+            connection,
+            logs_dir: self.paths.logs_dir.display().to_string(),
+            config_dir: self.paths.config_dir.display().to_string(),
+            log_tail: read_log_tail(&client_log_path(&self.paths), 80),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
+
+    fn import_config(
+        &self,
+        name: String,
+        raw_config: String,
+        socks_port: u16,
+    ) -> Result<(), String> {
+        let raw_config = raw_config.trim();
+        if raw_config.is_empty() {
+            return Err("client config is empty".into());
+        }
+        let parsed: Value =
+            serde_json::from_str(raw_config).map_err(|error| format!("invalid JSON: {error}"))?;
+        let route_mode = parsed
+            .pointer("/route/mode")
+            .and_then(Value::as_str)
+            .unwrap_or("direct")
+            .to_string();
+        let spreadsheet_id = parsed
+            .pointer("/sheets/spreadsheet_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let drive_folder_id = parsed
+            .pointer("/drive/folder_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if spreadsheet_id.is_empty() {
+            return Err("client config is missing sheets.spreadsheet_id".into());
+        }
+        let id = format!("profile-{}", epoch_millis());
+        let config_path = self.paths.config_dir.join(format!("{id}.json"));
+        fs::write(&config_path, raw_config)
+            .map_err(|error| format!("failed to write config: {error}"))?;
+
+        let profile = ClientProfile {
+            id: id.clone(),
+            name: if name.trim().is_empty() {
+                "Skirk profile".into()
+            } else {
+                name.trim().into()
+            },
+            config_path: config_path.display().to_string(),
+            socks_host: "127.0.0.1".into(),
+            socks_port,
+            route_mode,
+            spreadsheet_id,
+            drive_folder_id,
+        };
+        let mut profiles = load_profiles(&self.paths)?;
+        profiles.retain(|existing| existing.id != profile.id);
+        profiles.push(profile);
+        save_profiles(&self.paths, &profiles)?;
+        save_settings(
+            &self.paths,
+            &Settings {
+                selected_profile_id: Some(id),
+            },
+        )
+    }
+
+    fn delete_profile(&self, profile_id: &str) -> Result<(), String> {
+        let mut profiles = load_profiles(&self.paths)?;
+        if let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) {
+            let _ = fs::remove_file(&profile.config_path);
+        }
+        profiles.retain(|profile| profile.id != profile_id);
+        save_profiles(&self.paths, &profiles)?;
+        let mut settings = load_settings(&self.paths)?;
+        if settings.selected_profile_id.as_deref() == Some(profile_id) {
+            settings.selected_profile_id = profiles.first().map(|profile| profile.id.clone());
+            save_settings(&self.paths, &settings)?;
+        }
+        Ok(())
+    }
+
+    fn select_profile(&self, profile_id: Option<String>) -> Result<(), String> {
+        save_settings(
+            &self.paths,
+            &Settings {
+                selected_profile_id: profile_id,
+            },
+        )
+    }
+
+    fn connect(&self) -> Result<(), String> {
+        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned")?;
+        refresh_state(&mut state);
+        if state.client.is_some() {
+            return Ok(());
+        }
+        state.phase = ConnectionPhase::Connecting;
+        state.message = "Starting Skirk sidecar".into();
+        drop(state);
+
+        let profiles = load_profiles(&self.paths)?;
+        let settings = load_settings(&self.paths)?;
+        let profile = settings
+            .selected_profile_id
+            .as_ref()
+            .and_then(|id| profiles.iter().find(|profile| &profile.id == id))
+            .or_else(|| profiles.first())
+            .ok_or_else(|| "no profile selected".to_string())?
+            .clone();
+        let socks_address = format!("{}:{}", profile.socks_host, profile.socks_port);
+        ensure_port_free(&socks_address)?;
+        let skirk = self.resolve_sidecar()?;
+        let log_path = client_log_path(&self.paths);
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| format!("failed to open log: {error}"))?;
+        let log_err = log
+            .try_clone()
+            .map_err(|error| format!("failed to clone log: {error}"))?;
+        let mut command = Command::new(skirk);
+        command
+            .arg("client")
+            .arg("--config")
+            .arg(&profile.config_path)
+            .arg("--listen")
+            .arg(&socks_address)
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start skirk: {error}"))?;
+
+        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned")?;
+        state.client = Some(ManagedClient {
+            child,
+            profile_id: profile.id,
+            socks_address,
+        });
+        state.phase = ConnectionPhase::Connected;
+        state.message = "Connected".into();
+        Ok(())
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned")?;
+        state.phase = ConnectionPhase::Disconnecting;
+        if let Some(mut client) = state.client.take() {
+            let _ = client.child.kill();
+            let _ = client.child.wait();
+        }
+        state.phase = ConnectionPhase::Disconnected;
+        state.message = "Disconnected".into();
+        Ok(())
+    }
+
+    fn resolve_sidecar(&self) -> Result<PathBuf, String> {
+        let names: &[&str] = if cfg!(windows) {
+            &["skirk.exe", "skirk-windows-amd64.exe"]
+        } else {
+            &["skirk", "skirk-linux-amd64"]
+        };
+        let os_dir = if cfg!(windows) { "windows" } else { "linux" };
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for name in names {
+                    candidates.push(dir.join("sidecars").join(os_dir).join(name));
+                    candidates.push(dir.join(name));
+                }
+            }
+        }
+        if let Some(resource_dir) = self.resource_dir.as_ref() {
+            for name in names {
+                candidates.push(resource_dir.join("sidecars").join(os_dir).join(name));
+            }
+        }
+        if let Ok(current) = std::env::current_dir() {
+            for name in names {
+                candidates.push(current.join("../../bin").join(name));
+                candidates.push(current.join("../bin").join(name));
+                candidates.push(current.join("bin").join(name));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|path| path.exists())
+            .ok_or_else(|| {
+                "skirk sidecar not found; place skirk.exe beside the app or under sidecars/windows/"
+                    .into()
+            })
+    }
+}
+
+fn refresh_state(state: &mut RuntimeState) {
+    let Some(client) = state.client.as_mut() else {
+        if !matches!(state.phase, ConnectionPhase::Error) {
+            state.phase = ConnectionPhase::Disconnected;
+        }
+        return;
+    };
+    match client.child.try_wait() {
+        Ok(Some(status)) => {
+            state.client = None;
+            state.phase = ConnectionPhase::Error;
+            state.message = format!("Skirk exited: {status}");
+        }
+        Ok(None) => {
+            state.phase = ConnectionPhase::Connected;
+        }
+        Err(error) => {
+            state.client = None;
+            state.phase = ConnectionPhase::Error;
+            state.message = format!("Skirk status failed: {error}");
+        }
+    }
+}
+
+#[tauri::command]
+async fn load_snapshot(runtime: State<'_, DesktopRuntime>) -> Result<DesktopSnapshot, String> {
+    runtime.snapshot()
+}
+
+#[tauri::command]
+async fn import_config(
+    runtime: State<'_, DesktopRuntime>,
+    name: String,
+    raw_config: String,
+    socks_port: u16,
+) -> Result<DesktopSnapshot, String> {
+    runtime.import_config(name, raw_config, socks_port)?;
+    runtime.snapshot()
+}
+
+#[tauri::command]
+async fn delete_profile(
+    runtime: State<'_, DesktopRuntime>,
+    profile_id: String,
+) -> Result<DesktopSnapshot, String> {
+    runtime.delete_profile(&profile_id)?;
+    runtime.snapshot()
+}
+
+#[tauri::command]
+async fn select_profile(
+    runtime: State<'_, DesktopRuntime>,
+    profile_id: Option<String>,
+) -> Result<DesktopSnapshot, String> {
+    runtime.select_profile(profile_id)?;
+    runtime.snapshot()
+}
+
+#[tauri::command]
+async fn connect(runtime: State<'_, DesktopRuntime>) -> Result<DesktopSnapshot, String> {
+    runtime.connect()?;
+    runtime.snapshot()
+}
+
+#[tauri::command]
+async fn disconnect(runtime: State<'_, DesktopRuntime>) -> Result<DesktopSnapshot, String> {
+    runtime.disconnect()?;
+    runtime.snapshot()
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let paths = AppPaths::resolve(&app.handle())?;
+            let resource_dir = app.path().resource_dir().ok();
+            app.manage(DesktopRuntime::new(paths, resource_dir));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            load_snapshot,
+            import_config,
+            delete_profile,
+            select_profile,
+            connect,
+            disconnect
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Skirk desktop");
+}
+
+impl AppPaths {
+    fn resolve<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Self, String> {
+        let (config_dir, runtime_dir, logs_dir) = if let Some(root) = portable_root() {
+            (root.join("config"), root.join("runtime"), root.join("logs"))
+        } else {
+            let config_dir = app
+                .path()
+                .app_config_dir()
+                .map_err(|error| format!("failed to resolve config dir: {error}"))?;
+            let data_dir = app
+                .path()
+                .app_local_data_dir()
+                .map_err(|error| format!("failed to resolve data dir: {error}"))?;
+            (config_dir, data_dir.join("runtime"), data_dir.join("logs"))
+        };
+        for dir in [&config_dir, &runtime_dir, &logs_dir] {
+            fs::create_dir_all(dir)
+                .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+        }
+        Ok(Self {
+            profiles_file: config_dir.join("profiles.json"),
+            settings_file: config_dir.join("settings.json"),
+            config_dir,
+            logs_dir,
+        })
+    }
+}
+
+fn portable_root() -> Option<PathBuf> {
+    if std::env::var("SKIRK_PORTABLE")
+        .ok()
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        let exe = std::env::current_exe().ok()?;
+        return Some(exe.parent()?.join("portable-data"));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if dir.join("portable-data").exists() || dir.join("skirk-portable").exists() {
+        return Some(dir.join("portable-data"));
+    }
+    None
+}
+
+fn load_profiles(paths: &AppPaths) -> Result<Vec<ClientProfile>, String> {
+    read_json(&paths.profiles_file).or_else(|error| {
+        if paths.profiles_file.exists() {
+            Err(error)
+        } else {
+            Ok(Vec::new())
+        }
+    })
+}
+
+fn save_profiles(paths: &AppPaths, profiles: &[ClientProfile]) -> Result<(), String> {
+    write_json(&paths.profiles_file, profiles)
+}
+
+fn load_settings(paths: &AppPaths) -> Result<Settings, String> {
+    read_json(&paths.settings_file).or_else(|error| {
+        if paths.settings_file.exists() {
+            Err(error)
+        } else {
+            Ok(Settings::default())
+        }
+    })
+}
+
+fn save_settings(paths: &AppPaths, settings: &Settings) -> Result<(), String> {
+    write_json(&paths.settings_file, settings)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("failed to serialize JSON: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn client_log_path(paths: &AppPaths) -> PathBuf {
+    paths.logs_dir.join("skirk-client.log")
+}
+
+fn read_log_tail(path: &Path, limit: usize) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut lines = content.lines().collect::<Vec<_>>();
+    if lines.len() > limit {
+        lines = lines.split_off(lines.len() - limit);
+    }
+    lines.join("\n")
+}
+
+fn ensure_port_free(address: &str) -> Result<(), String> {
+    TcpListener::bind(address)
+        .map(|listener| drop(listener))
+        .map_err(|error| format!("{address} is not available: {error}"))
+}
+
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
