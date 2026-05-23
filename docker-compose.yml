@@ -1,0 +1,86 @@
+#   (default)  exit    - long-running exit node (serve-exit)
+#   client     client  - long-running SOCKS5/HTTP gateway (serve-client)
+#   setup      setup   - one-shot interactive kit generator (skirk setup init)
+#
+# Typical flows:
+#   docker compose --profile setup run --rm setup    # first-time provisioning
+#   docker compose up -d                             # production: exit only
+#   docker compose --profile client up -d            # local E2E: exit + client
+
+x-skirk-base: &skirk-base
+  image: ghcr.io/oiyoa/skirk:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  cap_drop: ["ALL"]
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    - TZ=${TZ:-UTC}
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  exit:
+    <<: *skirk-base
+    container_name: skirk-exit
+    restart: unless-stopped
+    read_only: true
+    volumes:
+      - skirk-kit:/data:rw
+
+  client:
+    <<: *skirk-base
+    container_name: skirk-client
+    restart: unless-stopped
+    profiles: ["client"]
+    read_only: true
+    volumes:
+      - skirk-kit:/data:ro
+    command:
+      - "serve-client"
+      - "--config"
+      - "/data/skirk-kit/client.json"
+      - "--listen"
+      - "0.0.0.0:18080"
+      - "--http-proxy-listen"
+      - "0.0.0.0:18081"
+    ports:
+      - "${SKIRK_SOCKS_PROXY_PORT:-18080}:18080"  # SOCKS5
+      - "${SKIRK_HTTP_PROXY_PORT:-18081}:18081"   # HTTP proxy
+
+  setup:
+    <<: *skirk-base
+    container_name: skirk-setup
+    profiles: ["setup"]
+    stdin_open: true
+    tty: true
+    restart: "no"
+    volumes:
+      - skirk-kit:/data:rw
+    command:
+      - "setup"
+      - "init"
+      - "--out"
+      - "/data/skirk-kit"
+      - "--oauth-mode"
+      - "personal"
+      - "--oauth-flow"
+      - "${SKIRK_OAUTH_FLOW:-desktop}"
+      - "--start-exit=false"
+
+volumes:
+  skirk-kit:
+    # Managed by Docker; mounted as /data/skirk-kit in all three services.
+    # Backup:   docker run --rm -v skirk_skirk-kit:/data -v "$PWD":/backup \
+    #             alpine tar -C / -czf /backup/skirk-kit.tgz data
+    # Restore:  docker run --rm -v skirk_skirk-kit:/data -v "$PWD":/backup \
+    #             alpine tar -C / -xzf /backup/skirk-kit.tgz

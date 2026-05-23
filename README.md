@@ -368,6 +368,28 @@ Each additional instance uses its own generated kit directory, service name,
 Google OAuth/Drive mailbox, proxy settings, cleanup flow, and performance
 tuning.
 
+## Run via Docker
+
+```sh
+cp .env.example .env
+# Set SKIRK_OAUTH_CLIENT_ID and SKIRK_OAUTH_CLIENT_SECRET from a Google
+# Cloud "Desktop app" OAuth client. See docs/setup.md for client creation.
+
+# Build locally (or skip to use the published image).
+docker compose build
+
+# Generate the kit. Setup prints a Google approval URL; open in any browser,
+# approve, then paste the redirected http://127.0.0.1:<port>/?code=... URL
+# from the failing browser page back into the terminal.
+docker compose --profile setup run --rm setup
+
+# Production deploy (exit only):
+docker compose up -d
+
+# To run the client:
+docker compose --profile client up -d
+```
+
 ## Documentation
 
 - [Install Guide](docs/install.md)
