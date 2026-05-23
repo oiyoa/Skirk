@@ -372,23 +372,50 @@ tuning.
 
 ```sh
 cp .env.example .env
-# Set SKIRK_OAUTH_CLIENT_ID and SKIRK_OAUTH_CLIENT_SECRET from a Google
-# Cloud "Desktop app" OAuth client. See docs/setup.md for client creation.
+```
 
-# Build locally (or skip to use the published image).
-docker compose build
+### Client only
 
-# Generate the kit. Setup prints a Google approval URL; open in any browser,
-# approve, then paste the redirected http://127.0.0.1:<port>/?code=... URL
-# from the failing browser page back into the terminal.
-docker compose --profile setup run --rm setup
+You only need the one-line client profile shared with you. No Google account, no setup, no kit volume:
 
-# Production deploy (exit only):
-docker compose up -d
-
-# To run the client:
+```sh
+# Paste the blob into .env as SKIRK_CLIENT_CONFIG=skirk:...
 docker compose --profile client up -d
 ```
+
+The client exposes SOCKS5 on `:18080` and HTTP on `:18081` (override host
+ports with `SKIRK_SOCKS_PROXY_PORT` / `SKIRK_HTTP_PROXY_PORT`).
+
+Test with:
+
+```sh
+curl --socks5-hostname 127.0.0.1:18080 https://ifconfig.me
+```
+
+### Exit node
+
+Requires a Google account and a Google Cloud "Desktop app" OAuth client.
+Set `SKIRK_OAUTH_CLIENT_ID` and `SKIRK_OAUTH_CLIENT_SECRET` in `.env`, then:
+
+```sh
+docker compose build                                # or pull the image
+docker compose --profile setup run --rm setup      # one-time, interactive
+docker compose up -d                                # long-running exit
+```
+
+Setup prints a Google approval URL; open it in any browser, approve, then
+paste the redirected `http://127.0.0.1:<port>/?code=...` URL from the
+(failing) browser page back into the terminal. Setup writes the kit into
+the `skirk-kit` named Docker volume and prints the one-line `skirk:...`
+profile to share with clients.
+
+Extract the blob to share later:
+
+```sh
+docker run --rm -v skirk_skirk-kit:/data alpine cat /data/skirk-kit/client.skirk
+```
+
+See [`.env.example`](.env.example) for every supported `SKIRK_*` env var.
 
 ## Documentation
 

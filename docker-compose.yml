@@ -3,9 +3,9 @@
 #   setup      setup   - one-shot interactive kit generator (skirk setup init)
 #
 # Typical flows:
-#   docker compose --profile setup run --rm setup    # first-time provisioning
-#   docker compose up -d                             # production: exit only
-#   docker compose --profile client up -d            # local E2E: exit + client
+#   docker compose --profile client up -d            # end user with a `skirk:...` blob
+#   docker compose --profile setup run --rm setup    # exit node: first-time provisioning
+#   docker compose up -d                             # exit node: long-running daemon
 
 x-skirk-base: &skirk-base
   image: ghcr.io/oiyoa/skirk:latest
@@ -43,12 +43,11 @@ services:
     restart: unless-stopped
     profiles: ["client"]
     read_only: true
-    volumes:
-      - skirk-kit:/data:ro
     command:
       - "serve-client"
       - "--config"
-      - "/data/skirk-kit/client.json"
+      # The one-line `skirk:...` blob shared by your exit node
+      - "${SKIRK_CLIENT_CONFIG}"
       - "--listen"
       - "0.0.0.0:18080"
       - "--http-proxy-listen"
